@@ -31,11 +31,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const row = document.createElement("div");
     row.className = `mr-candelx-msg ${who}`;
 
-    const bubble = document.createElement("div");
-    bubble.className = "mr-candelx-msg-bubble";
-    bubble.textContent = text;
+    const msgBubble = document.createElement("div");
+    msgBubble.className = "mr-candelx-msg-bubble";
+    msgBubble.textContent = text;
 
-    row.appendChild(bubble);
+    row.appendChild(msgBubble);
     messages.appendChild(row);
     messages.scrollTop = messages.scrollHeight;
   }
@@ -60,7 +60,7 @@ document.addEventListener("DOMContentLoaded", () => {
     typing.style.display = "block";
 
     try {
-      const res = await fetch("https://TUO-URL-RAILWAY/chat", {
+      const res = await fetch("https://shopify-ai-chat-production-d71a.up.railway.app/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
