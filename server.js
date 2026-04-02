@@ -30,6 +30,7 @@ const client = new OpenAI({
 const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const SITE_BASE = "https://eshop-candelx.com";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -38,6 +39,11 @@ const pool = new Pool({
 
 let shopifyToken = null;
 let shopifyTokenExpiresAt = 0;
+
+let siteCache = {
+  updatedAt: 0,
+  entries: []
+};
 
 async function initDb() {
   await pool.query(`
@@ -67,6 +73,161 @@ async function saveChatMessage({
     `,
     [sessionId, role, message, pageUrl, searchQuery]
   );
+}
+
+function normalizeText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function stripHtml(html) {
+  return normalizeText(
+    decodeHtmlEntities(
+      String(html || "")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+        .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+    )
+  );
+}
+
+function parseXmlLocs(xml) {
+  const matches = [...String(xml || "").matchAll(/<loc>(.*?)<\/loc>/gi)];
+  return matches.map((m) => decodeHtmlEntities(m[1].trim()));
+}
+
+async function fetchUrlText(url) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 Chat Assistant"
+      }
+    });
+
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+    const title = normalizeText(decodeHtmlEntities(titleMatch?.[1] || ""));
+    const text = stripHtml(html).slice(0, 6000);
+
+    return {
+      url,
+      title,
+      text
+    };
+  } catch {
+    return null;
+  }
+}
+
+function keywordSet(text) {
+  return new Set(
+    normalizeText(text)
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 3)
+  );
+}
+
+function scoreEntry(question, entry) {
+  const q = keywordSet(question);
+  const hay = normalizeText(`${entry.title} ${entry.url} ${entry.text}`).toLowerCase();
+
+  let score = 0;
+  for (const word of q) {
+    if (hay.includes(word)) score += 2;
+  }
+
+  if (/spedizion|shipping|delivery|resi|returns|refund|privacy|policy|faq|azienda|company|blog/i.test(entry.url)) {
+    score += 1;
+  }
+
+  return score;
+}
+
+async function refreshSiteCache() {
+  const now = Date.now();
+  if (siteCache.entries.length > 0 && now - siteCache.updatedAt < 60 * 60 * 1000) {
+    return siteCache.entries;
+  }
+
+  const sitemapResponse = await fetch(`${SITE_BASE}/sitemap.xml`);
+  if (!sitemapResponse.ok) {
+    throw new Error(`Impossibile leggere sitemap: ${sitemapResponse.status}`);
+  }
+
+  const sitemapXml = await sitemapResponse.text();
+  const sitemapUrls = parseXmlLocs(sitemapXml);
+
+  const relevantSitemaps = sitemapUrls.filter((url) =>
+    /sitemap_(pages|blogs|collections)/i.test(url)
+  );
+
+  let pageUrls = [];
+  for (const submap of relevantSitemaps) {
+    try {
+      const res = await fetch(submap);
+      if (!res.ok) continue;
+      const xml = await res.text();
+      pageUrls.push(...parseXmlLocs(xml));
+    } catch {
+      // ignore
+    }
+  }
+
+  pageUrls = [...new Set(pageUrls)]
+    .filter((url) => url.startsWith(SITE_BASE))
+    .slice(0, 40);
+
+  const entries = [];
+  for (const url of pageUrls) {
+    const entry = await fetchUrlText(url);
+    if (entry && entry.text) {
+      entries.push(entry);
+    }
+  }
+
+  siteCache = {
+    updatedAt: now,
+    entries
+  };
+
+  return entries;
+}
+
+async function getRelevantSiteContext(question) {
+  const entries = await refreshSiteCache();
+  if (!entries.length) return [];
+
+  const scored = entries
+    .map((entry) => ({
+      ...entry,
+      score: scoreEntry(question, entry)
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+
+  return scored.map((entry) => ({
+    url: entry.url,
+    title: entry.title,
+    snippet: entry.text.slice(0, 900)
+  }));
 }
 
 async function getShopifyToken() {
@@ -175,14 +336,14 @@ async function searchShopifyProducts(searchText) {
 
   return data.products.edges.map(({ node }) => {
     const firstVariant = node.variants.edges[0]?.node || null;
-    const cleanDescription = (node.description || "").replace(/\s+/g, " ").trim();
+    const cleanDescription = normalizeText(node.description || "");
 
     return {
       title: node.title,
       handle: node.handle,
       description: cleanDescription.slice(0, 220),
       status: node.status,
-      url: node.onlineStoreUrl || `https://eshop-candelx.com/products/${node.handle}`,
+      url: node.onlineStoreUrl || `${SITE_BASE}/products/${node.handle}`,
       image: node.featuredImage?.url || "",
       imageAlt: node.featuredImage?.altText || node.title,
       variantId: firstVariant?.legacyResourceId ? String(firstVariant.legacyResourceId) : "",
@@ -190,6 +351,65 @@ async function searchShopifyProducts(searchText) {
       variantTitle: firstVariant?.title || ""
     };
   });
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function classifyMessage(message) {
+  const response = await client.responses.create({
+    model: "gpt-5-mini",
+    input: [
+      {
+        role: "system",
+        content: `
+Classifica il messaggio di un cliente ecommerce in JSON puro.
+
+Restituisci SOLO JSON valido con queste chiavi:
+{
+  "intent": "greeting|generic_product_request|specific_product_request|technical_question|shipping_returns_service|b2b_request|other",
+  "reply_language": "it|en|fr|other",
+  "needs_product_search": true,
+  "needs_site_context": true,
+  "needs_clarification": false,
+  "clarifying_question": "",
+  "search_query": ""
+}
+
+Regole:
+- Se il messaggio è un semplice saluto, usa intent="greeting", needs_product_search=false, needs_clarification=false.
+- Se il messaggio parla di spedizione, resi, pagamenti, azienda, policy, usa needs_site_context=true.
+- Se il messaggio è tecnico su cere, stoppini, utilizzo, differenze, usa needs_site_context=true.
+- Se il messaggio chiede un prodotto in modo molto vago, usa needs_clarification=true e scrivi una sola domanda utile.
+- Cerca prodotti SOLO se ha senso commerciale.
+- Se il cliente scrive in inglese o francese, puoi trasformare search_query in termini italiani se questo aiuta a cercare nel catalogo.
+- search_query deve essere breve, 2-5 parole, oppure stringa vuota.
+`
+      },
+      {
+        role: "user",
+        content: message
+      }
+    ]
+  });
+
+  const parsed = safeJsonParse(response.output_text || "");
+  if (parsed) return parsed;
+
+  return {
+    intent: "other",
+    reply_language: "it",
+    needs_product_search: false,
+    needs_site_context: false,
+    needs_clarification: false,
+    clarifying_question: "",
+    search_query: ""
+  };
 }
 
 app.get("/", (req, res) => {
@@ -235,93 +455,86 @@ app.post("/chat", async (req, res) => {
         ? pageUrl.trim()
         : null;
 
-    const keywordResponse = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        {
-          role: "system",
-          content: `
-Sei un assistente che trasforma una richiesta cliente in parole chiave utili per cercare prodotti in un ecommerce di cere e materiali per candele.
-
-Regole:
-- restituisci solo una riga
-- massimo 2-5 parole chiave
-- niente frasi complete
-- se il cliente scrive in inglese o francese, puoi convertire la ricerca in termini italiani se questo aiuta a trovare prodotti del catalogo
-- privilegia termini concreti come: cera di soia, contenitori, stoppini, paraffina, gel, fragranze, stampi, bicchieri
-- se il messaggio è solo un saluto o è troppo generico, restituisci esattamente: generico
-`
-        },
-        {
-          role: "user",
-          content: cleanedMessage
-        }
-      ]
-    });
-
-    const searchQuery = (keywordResponse.output_text || cleanedMessage).trim();
+    const analysis = await classifyMessage(cleanedMessage);
 
     let products = [];
-    if (searchQuery.toLowerCase() !== "generico") {
-      products = await searchShopifyProducts(searchQuery);
+    let siteContext = [];
+
+    if (analysis.needs_site_context) {
+      siteContext = await getRelevantSiteContext(cleanedMessage);
     }
 
-    const response = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        {
-          role: "system",
-          content: `
+    if (analysis.needs_product_search && !analysis.needs_clarification) {
+      const query = normalizeText(analysis.search_query || "");
+      if (query) {
+        products = await searchShopifyProducts(query);
+      }
+    }
+
+    let reply = "";
+
+    if (analysis.needs_clarification && analysis.clarifying_question) {
+      reply = analysis.clarifying_question;
+    } else {
+      const response = await client.responses.create({
+        model: "gpt-5-mini",
+        input: [
+          {
+            role: "system",
+            content: `
 Sei Mr Candelx, assistente clienti di eshop-candelx.com.
 
-OBIETTIVO:
-aiutare il cliente a scegliere velocemente e portarlo verso i prodotti giusti.
+PERSONALITÀ:
+- naturale, umano, non robotico
+- utile e chiaro
+- commerciale ma non insistente
 
-REGOLE:
+REGOLE IMPORTANTI:
 - rispondi nella stessa lingua del cliente
-- usa SOLO i prodotti forniti se pertinenti
-- non inventare prodotti, prezzi o disponibilità
-- se non trovi prodotti pertinenti, dillo chiaramente
-- rispondi in modo breve, chiaro e commerciale
-- evita testi troppo lunghi
-- proponi al massimo 2 o 3 prodotti
-- non fare troppe domande
-- se serve, fai una sola domanda finale breve
-
-FORMATO:
-- una frase iniziale breve
-- elenco sintetico dei prodotti consigliati, se presenti
-- una chiusura breve con invito all'azione
-
-IMPORTANTE:
+- non cercare di vendere sempre per forza
+- se la domanda è tecnica, spiega bene prima di proporre prodotti
+- se la domanda è su spedizioni, resi, policy, usa il contesto del sito
+- se la richiesta è vaga, fai una sola domanda chiarificatrice
+- non inventare prodotti, prezzi, disponibilità, policy o tempi
+- usa SOLO i prodotti forniti se davvero pertinenti
+- se non hai certezza, dillo in modo semplice
 - non scrivere URL lunghi nel testo se non necessario
-- i prodotti verranno mostrati anche separatamente sotto la risposta
+- se proponi prodotti, massimo 2 o 3
+
+STILE:
+- evita elenchi troppo meccanici
+- risposte naturali, concise ma utili
+- se serve, chiudi con una domanda breve
 `
-        },
-        {
-          role: "user",
-          content: `
-Domanda cliente:
+          },
+          {
+            role: "user",
+            content: `
+Messaggio cliente:
 ${cleanedMessage}
 
-Query di ricerca usata:
-${searchQuery}
+Analisi intent:
+${JSON.stringify(analysis, null, 2)}
 
-Prodotti trovati nel negozio:
+Contesto sito:
+${JSON.stringify(siteContext, null, 2)}
+
+Prodotti trovati:
 ${JSON.stringify(products, null, 2)}
 `
-        }
-      ]
-    });
+          }
+        ]
+      });
 
-    const reply = response.output_text || "Nessuna risposta generata.";
+      reply = response.output_text || "Nessuna risposta generata.";
+    }
 
     await saveChatMessage({
       sessionId: safeSessionId,
       role: "user",
       message: cleanedMessage,
       pageUrl: safePageUrl,
-      searchQuery
+      searchQuery: analysis.search_query || null
     });
 
     await saveChatMessage({
@@ -329,7 +542,7 @@ ${JSON.stringify(products, null, 2)}
       role: "assistant",
       message: reply,
       pageUrl: safePageUrl,
-      searchQuery
+      searchQuery: analysis.search_query || null
     });
 
     res.json({
