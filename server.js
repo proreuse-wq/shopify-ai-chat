@@ -162,7 +162,24 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "Messaggio mancante" });
     }
 
-    const products = await searchShopifyProducts(message);
+    // usa OpenAI per trasformare la frase in parole chiave utili
+const keywordResponse = await client.responses.create({
+  model: "gpt-5-mini",
+  input: [
+    {
+      role: "system",
+      content: "Trasforma la frase in poche parole chiave per cercare prodotti ecommerce. Solo 2-4 parole."
+    },
+    {
+      role: "user",
+      content: message
+    }
+  ]
+});
+
+const searchQuery = (keywordResponse.output_text || message).trim();
+
+const products = await searchShopifyProducts(searchQuery);
 
     const response = await client.responses.create({
       model: "gpt-5-mini",
