@@ -7,7 +7,17 @@ import { URLSearchParams } from "url";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+app.use(
+  cors({
+    origin: [
+      "https://eshop-candelx.com",
+      "https://www.eshop-candelx.com",
+      "http://localhost:3000"
+    ]
+  })
+);
+
 app.use(express.json());
 app.use(express.static("public"));
 
@@ -88,7 +98,7 @@ async function shopifyGraphQL(query, variables = {}) {
 async function searchShopifyProducts(searchText) {
   const query = `
     query SearchProducts($search: String!) {
-      products(first: 5, query: $search) {
+      products(first: 4, query: $search) {
         edges {
           node {
             id
@@ -97,6 +107,20 @@ async function searchShopifyProducts(searchText) {
             description
             status
             onlineStoreUrl
+            featuredImage {
+              url
+              altText
+            }
+            variants(first: 1) {
+              edges {
+                node {
+                  id
+                  title
+                  price
+                  legacyResourceId
+                }
+              }
+            }
           }
         }
       }
@@ -107,13 +131,23 @@ async function searchShopifyProducts(searchText) {
     search: searchText,
   });
 
-  return data.products.edges.map(({ node }) => ({
-    title: node.title,
-    handle: node.handle,
-    description: node.description,
-    status: node.status,
-    url: node.onlineStoreUrl || `https://eshop-candelx.com/products/${node.handle}`,
-  }));
+  return data.products.edges.map(({ node }) => {
+    const firstVariant = node.variants.edges[0]?.node || null;
+    const cleanDescription = (node.description || "").replace(/\s+/g, " ").trim();
+
+    return {
+      title: node.title,
+      handle: node.handle,
+      description: cleanDescription.slice(0, 220),
+      status: node.status,
+      url: node.onlineStoreUrl || `https://eshop-candelx.com/products/${node.handle}`,
+      image: node.featuredImage?.url || "",
+      imageAlt: node.featuredImage?.altText || node.title,
+      variantId: firstVariant?.legacyResourceId ? String(firstVariant.legacyResourceId) : "",
+      price: firstVariant?.price || "",
+      variantTitle: firstVariant?.title || "",
+    };
+  });
 }
 
 app.get("/", (req, res) => {
@@ -124,7 +158,7 @@ app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
 
-    if (!message) {
+    if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Messaggio mancante" });
     }
 
@@ -139,24 +173,26 @@ app.post("/chat", async (req, res) => {
 Sei Mr Candelx, assistente clienti di eshop-candelx.com.
 
 OBIETTIVO:
-vendere e aiutare il cliente a scegliere velocemente.
+aiutare il cliente a scegliere velocemente e portarlo verso i prodotti giusti.
 
 REGOLE:
 - usa SOLO i prodotti forniti se pertinenti
-- non inventare prodotti o prezzi
-- non inventare disponibilità
-- rispondi in modo breve e chiaro
-- evita spiegazioni lunghe
-- proponi direttamente 2 o 3 prodotti con breve descrizione
-- usa tono commerciale ma naturale
+- non inventare prodotti, prezzi o disponibilità
+- se non trovi prodotti pertinenti, dillo chiaramente
+- rispondi in modo breve, chiaro e commerciale
+- evita testi troppo lunghi
+- proponi al massimo 2 o 3 prodotti
 - non fare troppe domande
-- se necessario fai al massimo 1 domanda finale
-- invita sempre a cliccare il prodotto o aggiungerlo al carrello
+- se serve, fai una sola domanda finale breve
 
 FORMATO:
-- breve introduzione
-- elenco prodotti consigliati (max 3)
-- eventuale consiglio rapido finale
+- una frase iniziale breve
+- elenco sintetico dei prodotti consigliati
+- una chiusura breve con invito all'azione
+
+IMPORTANTE:
+- non scrivere URL lunghi nel testo se non necessario
+- i prodotti verranno mostrati anche separatamente sotto la risposta
 `,
         },
         {
