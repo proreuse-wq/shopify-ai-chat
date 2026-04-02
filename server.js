@@ -2,8 +2,11 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import pg from "pg";
 
 dotenv.config();
+
+const { Pool } = pg;
 
 const app = express();
 
@@ -28,8 +31,43 @@ const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
 let shopifyToken = null;
 let shopifyTokenExpiresAt = 0;
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id BIGSERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      message TEXT NOT NULL,
+      page_url TEXT,
+      search_query TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+}
+
+async function saveChatMessage({
+  sessionId,
+  role,
+  message,
+  pageUrl = null,
+  searchQuery = null
+}) {
+  await pool.query(
+    `
+    INSERT INTO chat_messages (session_id, role, message, page_url, search_query)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [sessionId, role, message, pageUrl, searchQuery]
+  );
+}
 
 async function getShopifyToken() {
   if (shopifyToken && Date.now() < shopifyTokenExpiresAt - 60000) {
@@ -158,15 +196,44 @@ app.get("/", (req, res) => {
   res.sendFile(new URL("./public/index.html", import.meta.url).pathname);
 });
 
+app.get("/admin/chats", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, session_id, role, message, page_url, search_query, created_at
+      FROM chat_messages
+      ORDER BY created_at DESC
+      LIMIT 300
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Errore lettura chat",
+      details: error.message
+    });
+  }
+});
+
 app.post("/chat", async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, sessionId, pageUrl } = req.body;
 
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Messaggio mancante" });
     }
 
     const cleanedMessage = message.trim();
+
+    const safeSessionId =
+      typeof sessionId === "string" && sessionId.trim()
+        ? sessionId.trim()
+        : `anon_${Date.now()}`;
+
+    const safePageUrl =
+      typeof pageUrl === "string" && pageUrl.trim()
+        ? pageUrl.trim()
+        : null;
 
     const keywordResponse = await client.responses.create({
       model: "gpt-5-mini",
@@ -247,8 +314,26 @@ ${JSON.stringify(products, null, 2)}
       ]
     });
 
+    const reply = response.output_text || "Nessuna risposta generata.";
+
+    await saveChatMessage({
+      sessionId: safeSessionId,
+      role: "user",
+      message: cleanedMessage,
+      pageUrl: safePageUrl,
+      searchQuery
+    });
+
+    await saveChatMessage({
+      sessionId: safeSessionId,
+      role: "assistant",
+      message: reply,
+      pageUrl: safePageUrl,
+      searchQuery
+    });
+
     res.json({
-      reply: response.output_text || "Nessuna risposta generata.",
+      reply,
       products
     });
   } catch (error) {
@@ -260,6 +345,15 @@ ${JSON.stringify(products, null, 2)}
   }
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Server attivo sulla porta ${process.env.PORT || 3000}`);
-});
+const PORT = process.env.PORT || 3000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server attivo sulla porta ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Errore inizializzazione database:", error);
+    process.exit(1);
+  });
