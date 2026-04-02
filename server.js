@@ -385,10 +385,12 @@ Regole:
 - Se il messaggio è un semplice saluto, usa intent="greeting", needs_product_search=false, needs_clarification=false.
 - Se il messaggio parla di spedizione, resi, pagamenti, azienda, policy, usa needs_site_context=true.
 - Se il messaggio è tecnico su cere, stoppini, utilizzo, differenze, usa needs_site_context=true.
-- Se il messaggio chiede un prodotto in modo molto vago, usa needs_clarification=true e scrivi una sola domanda utile.
-- Cerca prodotti SOLO se ha senso commerciale.
+- Se il messaggio è un prodotto chiaro o abbastanza interpretabile, NON chiedere chiarimenti: prova a cercare prodotti.
+- Usa needs_clarification=true SOLO se manca un'informazione davvero indispensabile per rispondere bene.
+- Non fare più di una domanda chiarificatrice.
 - Se il cliente scrive in inglese o francese, puoi trasformare search_query in termini italiani se questo aiuta a cercare nel catalogo.
 - search_query deve essere breve, 2-5 parole, oppure stringa vuota.
+- Per richieste tipo "cera per contenitori", "cera di soia", "stoppini", "fragranze", "bicchieri", prova prima la ricerca e NON chiedere chiarimenti.
 `
       },
       {
@@ -473,9 +475,13 @@ app.post("/chat", async (req, res) => {
 
     let reply = "";
 
-    if (analysis.needs_clarification && analysis.clarifying_question) {
-      reply = analysis.clarifying_question;
-    } else {
+    if (
+  analysis.needs_clarification &&
+  analysis.clarifying_question &&
+  products.length === 0
+) {
+  reply = analysis.clarifying_question;
+} else {
       const response = await client.responses.create({
         model: "gpt-5-mini",
         input: [
