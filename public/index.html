@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Chat AI</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 760px;
+      margin: 30px auto;
+      padding: 0 15px;
+      background: #f7f7f7;
+    }
+
+    .chat-wrap {
+      background: #ffffff;
+      border: 1px solid #e5e5e5;
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.06);
+    }
+
+    .chat-header {
+      padding: 16px 18px;
+      border-bottom: 1px solid #ececec;
+      background: #ffffff;
+    }
+
+    .chat-header h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .chat-header p {
+      margin: 6px 0 0 0;
+      font-size: 13px;
+      color: #666;
+    }
+
+    #messages {
+      height: 460px;
+      overflow-y: auto;
+      padding: 16px;
+      background: #fafafa;
+    }
+
+    .msg {
+      margin: 10px 0;
+      display: flex;
+    }
+
+    .msg.user {
+      justify-content: flex-end;
+    }
+
+    .msg.bot {
+      justify-content: flex-start;
+    }
+
+    .bubble {
+      max-width: 78%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      font-size: 14px;
+    }
+
+    .user .bubble {
+      background: #dff1ff;
+    }
+
+    .bot .bubble {
+      background: #f0f0f0;
+    }
+
+    .typing {
+      font-style: italic;
+      color: #666;
+      font-size: 13px;
+      margin-top: 6px;
+    }
+
+    .chat-input {
+      display: flex;
+      gap: 10px;
+      padding: 14px;
+      border-top: 1px solid #ececec;
+      background: #fff;
+    }
+
+    #input {
+      flex: 1;
+      padding: 13px 14px;
+      border: 1px solid #d0d0d0;
+      border-radius: 12px;
+      font-size: 14px;
+      outline: none;
+    }
+
+    #input:focus {
+      border-color: #999;
+    }
+
+    #send {
+      padding: 13px 18px;
+      border: 0;
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="chat-wrap">
+    <div class="chat-header">
+      <h2>Assistenza clienti</h2>
+      <p>Scrivi una domanda su cere, materiali e uso dei prodotti.</p>
+    </div>
+
+    <div id="messages"></div>
+
+    <div class="chat-input">
+      <input id="input" type="text" placeholder="Scrivi un messaggio..." />
+      <button id="send">Invia</button>
+    </div>
+  </div>
+
+  <script>
+    const input = document.getElementById("input");
+    const messages = document.getElementById("messages");
+    const sendButton = document.getElementById("send");
+    let typingNode = null;
+
+    function addMessage(text, who) {
+      const row = document.createElement("div");
+      row.className = `msg ${who}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+
+      row.appendChild(bubble);
+      messages.appendChild(row);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function showTyping() {
+      if (typingNode) return;
+
+      typingNode = document.createElement("div");
+      typingNode.className = "typing";
+      typingNode.textContent = "L'assistente sta scrivendo...";
+      messages.appendChild(typingNode);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function hideTyping() {
+      if (typingNode) {
+        typingNode.remove();
+        typingNode = null;
+      }
+    }
+
+    async function sendMessage() {
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMessage(text, "user");
+      input.value = "";
+      input.focus();
+      showTyping();
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ message: text })
+        });
+
+        const data = await res.json();
+        hideTyping();
+        addMessage(data.reply || "Errore nella risposta.", "bot");
+      } catch (error) {
+        hideTyping();
+        addMessage("Errore di collegamento al server.", "bot");
+      }
+    }
+
+    sendButton.addEventListener("click", sendMessage);
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        sendMessage();
+      }
+    });
+
+    addMessage("Ciao, sono Mr Candelx, l'assistente virtuale. Posso aiutarti con cere, materiali e consigli d'uso.", "bot");
+  </script>
+
+</body>
+</html>
