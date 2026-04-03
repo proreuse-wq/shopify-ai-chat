@@ -332,6 +332,8 @@ async function searchShopifyProducts(searchText) {
                   title
                   price
                   legacyResourceId
+                  inventoryQuantity
+                  inventoryPolicy
                 }
               }
             }
@@ -348,6 +350,11 @@ async function searchShopifyProducts(searchText) {
   const rawProducts = data.products.edges.map(({ node }) => {
     const firstVariant = node.variants.edges[0]?.node || null;
     const cleanDescription = normalizeText(node.description || "");
+    const inventoryQuantity =
+      typeof firstVariant?.inventoryQuantity === "number"
+        ? firstVariant.inventoryQuantity
+        : null;
+    const inventoryPolicy = firstVariant?.inventoryPolicy || "";
 
     return {
       title: node.title,
@@ -361,7 +368,13 @@ async function searchShopifyProducts(searchText) {
       imageAlt: node.featuredImage?.altText || node.title,
       variantId: firstVariant?.legacyResourceId ? String(firstVariant.legacyResourceId) : "",
       price: firstVariant?.price || "",
-      variantTitle: firstVariant?.title || ""
+      variantTitle: firstVariant?.title || "",
+      inventoryQuantity,
+      inventoryPolicy,
+      inStock:
+        inventoryQuantity === null
+          ? inventoryPolicy === "CONTINUE"
+          : inventoryQuantity > 0 || inventoryPolicy === "CONTINUE"
     };
   });
 
@@ -403,7 +416,7 @@ async function searchShopifyProducts(searchText) {
       ...product,
       _score: productScore(product)
     }))
-    .filter((product) => product._score > 0)
+    .filter((product) => product._score > 0 && product.inStock)
     .sort((a, b) => b._score - a._score)
     .slice(0, 6);
 }
@@ -858,7 +871,7 @@ COSA PUOI FARE:
 - dare orientamento sui prodotti
 - spiegare differenze generali tra materiali e usi
 - usare le informazioni del sito fornite nel contesto
-- suggerire prodotti SOLO se i prodotti trovati sono chiaramente pertinenti
+- suggerire prodotti SOLO se i prodotti trovati sono chiaramente pertinenti e disponibili
 
 COSA NON DEVI MAI FARE:
 - non dire mai che aggiungi prodotti al carrello
@@ -877,7 +890,7 @@ REGOLE IMPORTANTI:
 - se la richiesta è vaga, fai al massimo UNA domanda chiarificatrice
 - se la domanda è tecnica, spiega bene prima di proporre prodotti
 - se la domanda è su spedizioni, resi, policy, usa il contesto del sito
-- usa SOLO i prodotti forniti se davvero pertinenti
+- usa SOLO i prodotti forniti se davvero pertinenti e disponibili
 - se non hai certezza, dillo in modo semplice e invita a scrivere a ${SUPPORT_EMAIL}
 - non scrivere URL lunghi nel testo se non necessario
 - se proponi prodotti, massimo 2 o 3
