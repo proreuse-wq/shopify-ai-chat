@@ -24,7 +24,7 @@ app.use(express.json());
 app.use(express.static("public"));
 
 const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 const SHOP = process.env.SHOPIFY_SHOP;
@@ -84,9 +84,7 @@ async function saveChatMessage({
 }
 
 function normalizeText(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(text || "").replace(/\s+/g, " ").trim();
 }
 
 function decodeHtmlEntities(text) {
@@ -299,9 +297,7 @@ async function shopifyGraphQL(query, variables = {}) {
   const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(
-      `Errore GraphQL Shopify: ${response.status} - ${JSON.stringify(data)}`
-    );
+    throw new Error(`Errore GraphQL Shopify: ${response.status} - ${JSON.stringify(data)}`);
   }
 
   if (data.errors) {
@@ -314,13 +310,15 @@ async function shopifyGraphQL(query, variables = {}) {
 async function searchShopifyProducts(searchText) {
   const query = `
     query SearchProducts($search: String!) {
-      products(first: 4, query: $search) {
+      products(first: 12, query: $search) {
         edges {
           node {
             id
             title
             handle
             description
+            productType
+            tags
             status
             onlineStoreUrl
             featuredImage {
@@ -347,14 +345,16 @@ async function searchShopifyProducts(searchText) {
     search: searchText
   });
 
-  return data.products.edges.map(({ node }) => {
+  const rawProducts = data.products.edges.map(({ node }) => {
     const firstVariant = node.variants.edges[0]?.node || null;
     const cleanDescription = normalizeText(node.description || "");
 
     return {
       title: node.title,
       handle: node.handle,
-      description: cleanDescription.slice(0, 220),
+      description: cleanDescription.slice(0, 400),
+      productType: normalizeText(node.productType || ""),
+      tags: Array.isArray(node.tags) ? node.tags : [],
       status: node.status,
       url: node.onlineStoreUrl || `${SITE_BASE}/products/${node.handle}`,
       image: node.featuredImage?.url || "",
@@ -364,6 +364,48 @@ async function searchShopifyProducts(searchText) {
       variantTitle: firstVariant?.title || ""
     };
   });
+
+  const words = normalizeText(searchText)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  function productScore(product) {
+    const haystack = normalizeText(
+      [
+        product.title,
+        product.handle,
+        product.description,
+        product.productType,
+        ...(product.tags || [])
+      ].join(" ")
+    ).toLowerCase();
+
+    let score = 0;
+
+    for (const word of words) {
+      if (haystack.includes(word)) score += 3;
+    }
+
+    if (words.includes("contenitori") && haystack.includes("contenitori")) score += 8;
+    if (words.includes("stampi") && haystack.includes("stampi")) score += 8;
+    if (words.includes("soia") && haystack.includes("soia")) score += 8;
+    if (words.includes("paraffina") && haystack.includes("paraffina")) score += 8;
+    if (words.includes("cocco") && haystack.includes("cocco")) score += 8;
+    if (words.includes("bicchieri") && haystack.includes("bicchier")) score += 6;
+    if (words.includes("profumate") && haystack.includes("profum")) score += 5;
+
+    return score;
+  }
+
+  return rawProducts
+    .map((product) => ({
+      ...product,
+      _score: productScore(product)
+    }))
+    .filter((product) => product._score > 0)
+    .sort((a, b) => b._score - a._score)
+    .slice(0, 6);
 }
 
 function safeJsonParse(text) {
@@ -391,7 +433,12 @@ Restituisci SOLO JSON valido con queste chiavi:
   "needs_site_context": true,
   "needs_clarification": false,
   "clarifying_question": "",
-  "search_query": ""
+  "search_query": "",
+  "product_attributes": {
+    "material": "",
+    "usage": "",
+    "form": ""
+  }
 }
 
 Regole:
@@ -405,6 +452,12 @@ Regole:
 - search_query deve essere breve, 2-5 parole, oppure stringa vuota.
 - Per richieste tipo "cera per contenitori", "cera di soia", "stoppini", "fragranze", "bicchieri", prova prima la ricerca e NON chiedere chiarimenti.
 - Se la richiesta riguarda ordine, supporto umano, problemi specifici, prezzi contestati, disponibilità reale o assistenza, classificala come shipping_returns_service o other e NON puntare sulla ricerca prodotti.
+- riconosci attributi prodotto come:
+  - material: soia, paraffina, cocco, api, gel
+  - usage: contenitori, stampi, bicchieri, pillar, tea light
+  - form: profumate, decorative, professionali
+- se il cliente cita contenitori o stampi, trattali come attributi forti del prodotto
+- costruisci search_query usando questi attributi in modo diretto
 `
       },
       {
@@ -424,7 +477,12 @@ Regole:
     needs_site_context: false,
     needs_clarification: false,
     clarifying_question: "",
-    search_query: ""
+    search_query: "",
+    product_attributes: {
+      material: "",
+      usage: "",
+      form: ""
+    }
   };
 }
 
@@ -698,7 +756,7 @@ app.post("/chat", async (req, res) => {
     }
 
     if (!safeCustomerEmail) {
-      const askEmailReply = `Prima di continuare, puoi scrivermi la tua email? Così sappiamo con chi stiamo parlando.`;
+      const askEmailReply = "Prima di continuare, puoi scrivermi la tua email? Così sappiamo con chi stiamo parlando.";
 
       await saveChatMessage({
         sessionId: safeSessionId,
@@ -766,16 +824,6 @@ app.post("/chat", async (req, res) => {
       const query = normalizeText(analysis.search_query || "");
       if (query) {
         products = await searchShopifyProducts(query);
-
-        const queryWords = normalizeText(query).toLowerCase().split(/\s+/).filter(Boolean);
-
-        products = products.filter((product) => {
-          const haystack = normalizeText(
-            `${product.title} ${product.description} ${product.handle}`
-          ).toLowerCase();
-
-          return queryWords.length === 0 || queryWords.some((word) => haystack.includes(word));
-        });
       }
     }
 
@@ -838,13 +886,30 @@ REGOLE IMPORTANTI:
 - se la richiesta riguarda una categoria generica e il catalogo non conferma risultati affidabili, dai prima un orientamento generale e poi fai una sola domanda breve
 - non trasformare consigli tecnici generali in disponibilità di catalogo
 - non suggerire additivi, miscele o ingredienti specifici come prodotti disponibili se non compaiono tra i prodotti trovati
+- non rispondere come un articolo o una guida generale, a meno che il cliente chieda esplicitamente una spiegazione tecnica
+- parti sempre dal messaggio appena scritto dal cliente e rispondi in modo diretto
+- se il cliente chiede un'alternativa, non ricominciare da zero con una panoramica completa: proponi subito una direzione pratica
+- evita elenchi lunghi quando basta una risposta breve
+- non dire troppo facilmente che non vedi prodotti nel catalogo
+- se non hai prodotti pertinenti, dai un orientamento breve e utile senza appesantire la risposta
+- non chiudere ogni volta con l'email di supporto: usala solo quando la richiesta richiede davvero assistenza umana o informazioni che non puoi dare
+- se il cliente fa una domanda semplice, rispondi in 2-4 frasi al massimo
+- privilegia risposte commerciali concrete, non spiegazioni scolastiche
 
-STILE RISPOSTA:
-- evita elenchi troppo meccanici
-- niente risposte troppo lunghe
-- niente interrogatori
-- se puoi aiutare subito, aiuta subito
-- se non puoi aiutare bene, dillo chiaramente e invita a scrivere a ${SUPPORT_EMAIL}
+ESEMPI DI STILE:
+Se il cliente scrive:
+"allora consigliami un'altra cera"
+rispondi più così:
+"Certo. Se mi dici se la vuoi per contenitori o per stampi, ti indirizzo subito meglio. In generale, per contenitori si va più spesso su una cera di soia o una miscela simile; per stampi serve una cera più rigida."
+
+Se il cliente scrive:
+"mi serve una cera per contenitori"
+rispondi più così:
+"Per contenitori ti orienterei su una cera di soia o su una miscela adatta ai vasetti. Se vuoi, posso proporti direttamente alcune opzioni del sito."
+
+Se il cliente scrive:
+"che differenza c'è tra soia e paraffina?"
+qui invece puoi spiegare in modo semplice e breve, poi eventualmente suggerire una scelta.
 `
           },
           {
