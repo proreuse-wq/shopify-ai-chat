@@ -55,8 +55,14 @@ async function initDb() {
       message TEXT NOT NULL,
       page_url TEXT,
       search_query TEXT,
+      customer_email TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE chat_messages
+    ADD COLUMN IF NOT EXISTS customer_email TEXT
   `);
 }
 
@@ -65,14 +71,15 @@ async function saveChatMessage({
   role,
   message,
   pageUrl = null,
-  searchQuery = null
+  searchQuery = null,
+  customerEmail = null
 }) {
   await pool.query(
     `
-    INSERT INTO chat_messages (session_id, role, message, page_url, search_query)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO chat_messages (session_id, role, message, page_url, search_query, customer_email)
+    VALUES ($1, $2, $3, $4, $5, $6)
     `,
-    [sessionId, role, message, pageUrl, searchQuery]
+    [sessionId, role, message, pageUrl, searchQuery, customerEmail]
   );
 }
 
@@ -108,6 +115,11 @@ function stripHtml(html) {
 function parseXmlLocs(xml) {
   const matches = [...String(xml || "").matchAll(/<loc>(.*?)<\/loc>/gi)];
   return matches.map((m) => decodeHtmlEntities(m[1].trim()));
+}
+
+function extractEmail(text) {
+  const match = String(text).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0] : null;
 }
 
 async function fetchUrlText(url) {
@@ -423,10 +435,10 @@ app.get("/", (req, res) => {
 app.get("/admin/chats", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT id, session_id, role, message, page_url, search_query, created_at
+      SELECT id, session_id, role, message, page_url, search_query, customer_email, created_at
       FROM chat_messages
       ORDER BY created_at DESC
-      LIMIT 300
+      LIMIT 500
     `);
 
     res.json(result.rows);
@@ -439,9 +451,175 @@ app.get("/admin/chats", async (req, res) => {
   }
 });
 
+app.get("/admin/chats/sessions", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        session_id,
+        MAX(customer_email) FILTER (WHERE customer_email IS NOT NULL AND customer_email <> '') AS customer_email,
+        MIN(created_at) AS started_at,
+        MAX(created_at) AS last_message_at,
+        COUNT(*) AS total_messages,
+        MAX(page_url) FILTER (WHERE page_url IS NOT NULL AND page_url <> '') AS last_page_url
+      FROM chat_messages
+      GROUP BY session_id
+      ORDER BY last_message_at DESC
+      LIMIT 200
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Errore lettura sessioni",
+      details: error.message
+    });
+  }
+});
+
+app.get("/admin/chats/session/:sessionId", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, session_id, role, message, page_url, search_query, customer_email, created_at
+      FROM chat_messages
+      WHERE session_id = $1
+      ORDER BY created_at ASC
+      `,
+      [req.params.sessionId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Errore lettura sessione",
+      details: error.message
+    });
+  }
+});
+
+app.get("/admin/inbox", async (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <title>Chat Inbox</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #f5f5f5; }
+    .layout { display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
+    .sidebar { border-right: 1px solid #ddd; background: #fff; overflow-y: auto; }
+    .content { padding: 20px; overflow-y: auto; }
+    .session { padding: 14px 16px; border-bottom: 1px solid #eee; cursor: pointer; }
+    .session:hover { background: #f7f7f7; }
+    .session.active { background: #eef7f0; }
+    .email { font-weight: 700; color: #157A3A; margin-bottom: 4px; }
+    .meta { font-size: 12px; color: #666; }
+    .msg { margin-bottom: 12px; display: flex; }
+    .msg.user { justify-content: flex-end; }
+    .msg.assistant { justify-content: flex-start; }
+    .bubble { max-width: 70%; padding: 10px 12px; border-radius: 12px; line-height: 1.4; white-space: pre-wrap; }
+    .user .bubble { background: #e6f4ea; }
+    .assistant .bubble { background: #fff; border: 1px solid #ddd; }
+    .topbar { margin-bottom: 16px; }
+    .muted { color: #666; font-size: 13px; }
+    a { color: #157A3A; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="sidebar" id="sessions"></div>
+    <div class="content">
+      <div class="topbar">
+        <h2 style="margin:0 0 8px;">Inbox chat</h2>
+        <div class="muted" id="sessionMeta">Seleziona una sessione a sinistra.</div>
+      </div>
+      <div id="messages"></div>
+    </div>
+  </div>
+
+  <script>
+    const sessionsEl = document.getElementById("sessions");
+    const messagesEl = document.getElementById("messages");
+    const sessionMetaEl = document.getElementById("sessionMeta");
+    let activeSessionId = null;
+
+    function esc(text) {
+      return String(text || "").replace(/[&<>"]/g, (m) => ({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        '"':"&quot;"
+      }[m]));
+    }
+
+    async function loadSessions() {
+      const res = await fetch("/admin/chats/sessions");
+      const sessions = await res.json();
+
+      sessionsEl.innerHTML = sessions.map((s) => {
+        return \`
+          <div class="session \${activeSessionId === s.session_id ? "active" : ""}" data-session-id="\${esc(s.session_id)}">
+            <div class="email">\${esc(s.customer_email || "Email non disponibile")}</div>
+            <div class="meta">Sessione: \${esc(s.session_id)}</div>
+            <div class="meta">Messaggi: \${esc(s.total_messages)}</div>
+            <div class="meta">Ultima attività: \${esc(s.last_message_at)}</div>
+          </div>
+        \`;
+      }).join("");
+
+      sessionsEl.querySelectorAll(".session").forEach((el) => {
+        el.addEventListener("click", async () => {
+          activeSessionId = el.getAttribute("data-session-id");
+          await loadSessions();
+          await loadSession(activeSessionId);
+        });
+      });
+    }
+
+    async function loadSession(sessionId) {
+      const res = await fetch("/admin/chats/session/" + encodeURIComponent(sessionId));
+      const rows = await res.json();
+
+      if (!rows.length) {
+        messagesEl.innerHTML = "<p>Nessun messaggio.</p>";
+        sessionMetaEl.textContent = "Nessun dettaglio disponibile.";
+        return;
+      }
+
+      const email = rows.find((r) => r.customer_email)?.customer_email || "Email non disponibile";
+      const page = rows[rows.length - 1].page_url || "";
+      sessionMetaEl.innerHTML = \`
+        <strong>Email:</strong> \${esc(email)}<br>
+        <strong>Sessione:</strong> \${esc(sessionId)}<br>
+        <strong>Ultima pagina:</strong> \${page ? '<a href="' + esc(page) + '" target="_blank" rel="noopener noreferrer">' + esc(page) + '</a>' : 'n/d'}
+      \`;
+
+      messagesEl.innerHTML = rows.map((row) => {
+        return \`
+          <div class="msg \${esc(row.role)}">
+            <div class="bubble">
+              <div style="font-size:12px; color:#666; margin-bottom:4px;">
+                \${esc(row.role)} · \${esc(row.created_at)}
+              </div>
+              \${esc(row.message)}
+            </div>
+          </div>
+        \`;
+      }).join("");
+    }
+
+    loadSessions();
+  </script>
+</body>
+</html>
+  `);
+});
+
 app.post("/chat", async (req, res) => {
   try {
-    const { message, sessionId, pageUrl } = req.body;
+    const { message, sessionId, pageUrl, customerEmail } = req.body;
 
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Messaggio mancante" });
@@ -458,6 +636,11 @@ app.post("/chat", async (req, res) => {
       typeof pageUrl === "string" && pageUrl.trim()
         ? pageUrl.trim()
         : null;
+
+    const extractedEmail = extractEmail(cleanedMessage);
+    const safeCustomerEmail =
+      extractedEmail ||
+      (typeof customerEmail === "string" && customerEmail.trim() ? customerEmail.trim() : null);
 
     const lowerMessage = cleanedMessage.toLowerCase();
 
@@ -486,15 +669,72 @@ app.post("/chat", async (req, res) => {
       "modifica ordine"
     ];
 
-    if (humanSupportPatterns.some((pattern) => lowerMessage.includes(pattern))) {
-      const safeReply = `Per questa richiesta preferisco non darti un'informazione imprecisa. Ti chiediamo di scrivere a ${SUPPORT_EMAIL} così il nostro team può aiutarti direttamente.`;
+    if (extractedEmail) {
+      const emailReply = `Perfetto, ho registrato la tua email: ${extractedEmail}. Dimmi pure come posso aiutarti.`;
 
       await saveChatMessage({
         sessionId: safeSessionId,
         role: "user",
         message: cleanedMessage,
         pageUrl: safePageUrl,
-        searchQuery: null
+        searchQuery: null,
+        customerEmail: safeCustomerEmail
+      });
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "assistant",
+        message: emailReply,
+        pageUrl: safePageUrl,
+        searchQuery: null,
+        customerEmail: safeCustomerEmail
+      });
+
+      return res.json({
+        reply: emailReply,
+        products: [],
+        customerEmail: safeCustomerEmail
+      });
+    }
+
+    if (!safeCustomerEmail) {
+      const askEmailReply = `Prima di continuare, puoi scrivermi la tua email? Così sappiamo con chi stiamo parlando.`;
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "user",
+        message: cleanedMessage,
+        pageUrl: safePageUrl,
+        searchQuery: null,
+        customerEmail: null
+      });
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "assistant",
+        message: askEmailReply,
+        pageUrl: safePageUrl,
+        searchQuery: null,
+        customerEmail: null
+      });
+
+      return res.json({
+        reply: askEmailReply,
+        products: [],
+        customerEmail: null
+      });
+    }
+
+    if (humanSupportPatterns.some((pattern) => lowerMessage.includes(pattern))) {
+      const safeReply = `Per questa richiesta ti chiediamo di scrivere a ${SUPPORT_EMAIL} così il nostro team può aiutarti direttamente.`;
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "user",
+        message: cleanedMessage,
+        pageUrl: safePageUrl,
+        searchQuery: null,
+        customerEmail: safeCustomerEmail
       });
 
       await saveChatMessage({
@@ -502,12 +742,14 @@ app.post("/chat", async (req, res) => {
         role: "assistant",
         message: safeReply,
         pageUrl: safePageUrl,
-        searchQuery: null
+        searchQuery: null,
+        customerEmail: safeCustomerEmail
       });
 
       return res.json({
         reply: safeReply,
-        products: []
+        products: [],
+        customerEmail: safeCustomerEmail
       });
     }
 
@@ -622,6 +864,9 @@ ${JSON.stringify(products, null, 2)}
 
 Email supporto da usare se serve:
 ${SUPPORT_EMAIL}
+
+Email cliente:
+${safeCustomerEmail}
 `
           }
         ]
@@ -635,7 +880,8 @@ ${SUPPORT_EMAIL}
       role: "user",
       message: cleanedMessage,
       pageUrl: safePageUrl,
-      searchQuery: analysis.search_query || null
+      searchQuery: analysis.search_query || null,
+      customerEmail: safeCustomerEmail
     });
 
     await saveChatMessage({
@@ -643,12 +889,14 @@ ${SUPPORT_EMAIL}
       role: "assistant",
       message: reply,
       pageUrl: safePageUrl,
-      searchQuery: analysis.search_query || null
+      searchQuery: analysis.search_query || null,
+      customerEmail: safeCustomerEmail
     });
 
     res.json({
       reply,
-      products
+      products,
+      customerEmail: safeCustomerEmail
     });
   } catch (error) {
     console.error(error);
