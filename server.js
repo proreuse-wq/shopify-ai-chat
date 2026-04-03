@@ -31,6 +31,7 @@ const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SITE_BASE = "https://eshop-candelx.com";
+const SUPPORT_EMAIL = "candelx@eshop-candelx.com";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -391,6 +392,7 @@ Regole:
 - Se il cliente scrive in inglese o francese, puoi trasformare search_query in termini italiani se questo aiuta a cercare nel catalogo.
 - search_query deve essere breve, 2-5 parole, oppure stringa vuota.
 - Per richieste tipo "cera per contenitori", "cera di soia", "stoppini", "fragranze", "bicchieri", prova prima la ricerca e NON chiedere chiarimenti.
+- Se la richiesta riguarda ordine, supporto umano, problemi specifici, prezzi contestati, disponibilità reale o assistenza, classificala come shipping_returns_service o other e NON puntare sulla ricerca prodotti.
 `
       },
       {
@@ -457,6 +459,58 @@ app.post("/chat", async (req, res) => {
         ? pageUrl.trim()
         : null;
 
+    const lowerMessage = cleanedMessage.toLowerCase();
+
+    const humanSupportPatterns = [
+      "operatore",
+      "persona",
+      "umano",
+      "richiam",
+      "chiamami",
+      "chiamatemi",
+      "telefono",
+      "numero ordine",
+      "ordine",
+      "supporto",
+      "assistenza",
+      "prezzo aumentato",
+      "prezzo cambiato",
+      "magazzino",
+      "disponibil",
+      "stock",
+      "live chat",
+      "whatsapp",
+      "problema",
+      "reclamo",
+      "errore ordine",
+      "modifica ordine"
+    ];
+
+    if (humanSupportPatterns.some((pattern) => lowerMessage.includes(pattern))) {
+      const safeReply = `Per questa richiesta preferisco non darti un'informazione imprecisa. Ti chiediamo di scrivere a ${SUPPORT_EMAIL} così il nostro team può aiutarti direttamente.`;
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "user",
+        message: cleanedMessage,
+        pageUrl: safePageUrl,
+        searchQuery: null
+      });
+
+      await saveChatMessage({
+        sessionId: safeSessionId,
+        role: "assistant",
+        message: safeReply,
+        pageUrl: safePageUrl,
+        searchQuery: null
+      });
+
+      return res.json({
+        reply: safeReply,
+        products: []
+      });
+    }
+
     const analysis = await classifyMessage(cleanedMessage);
 
     let products = [];
@@ -470,18 +524,28 @@ app.post("/chat", async (req, res) => {
       const query = normalizeText(analysis.search_query || "");
       if (query) {
         products = await searchShopifyProducts(query);
+
+        const queryWords = normalizeText(query).toLowerCase().split(/\s+/).filter(Boolean);
+
+        products = products.filter((product) => {
+          const haystack = normalizeText(
+            `${product.title} ${product.description} ${product.handle}`
+          ).toLowerCase();
+
+          return queryWords.length === 0 || queryWords.some((word) => haystack.includes(word));
+        });
       }
     }
 
     let reply = "";
 
     if (
-  analysis.needs_clarification &&
-  analysis.clarifying_question &&
-  products.length === 0
-) {
-  reply = analysis.clarifying_question;
-} else {
+      analysis.needs_clarification &&
+      analysis.clarifying_question &&
+      products.length === 0
+    ) {
+      reply = analysis.clarifying_question;
+    } else {
       const response = await client.responses.create({
         model: "gpt-5-mini",
         input: [
@@ -490,20 +554,41 @@ app.post("/chat", async (req, res) => {
             content: `
 Sei Mr Candelx, assistente clienti di eshop-candelx.com.
 
-PERSONALITÀ:
-- naturale, umano, non robotico
-- utile e chiaro
-- commerciale ma non insistente
+MODALITÀ PROTETTA:
+Il tuo obiettivo è aiutare il cliente senza creare confusione, senza promettere azioni che non puoi eseguire e senza dare informazioni non confermate.
+
+TONO:
+- naturale
+- umano
+- professionale
+- breve e chiaro
+- non robotico
+
+COSA PUOI FARE:
+- dare orientamento sui prodotti
+- spiegare differenze generali tra materiali e usi
+- usare le informazioni del sito fornite nel contesto
+- suggerire prodotti SOLO se i prodotti trovati sono chiaramente pertinenti
+
+COSA NON DEVI MAI FARE:
+- non dire mai che aggiungi prodotti al carrello
+- non dire mai che controlli il magazzino
+- non dire mai che richiami il cliente
+- non dire mai che inoltri a un operatore
+- non dire mai che modifichi ordini o prenoti chat/chiamate
+- non dire mai che verifichi disponibilità reale, stock, tempi specifici o prezzi futuri se non confermati chiaramente
+- non promettere azioni interne dell’azienda
+- non inventare prodotti, prezzi, disponibilità, policy o servizi
 
 REGOLE IMPORTANTI:
 - rispondi nella stessa lingua del cliente
-- non cercare di vendere sempre per forza
+- se la richiesta è su ordini, disponibilità reale, contestazioni di prezzo, supporto umano, richieste commerciali delicate o problemi post-vendita, NON improvvisare
+- in quei casi indirizza il cliente a scrivere a ${SUPPORT_EMAIL}
+- se la richiesta è vaga, fai al massimo UNA domanda chiarificatrice
 - se la domanda è tecnica, spiega bene prima di proporre prodotti
 - se la domanda è su spedizioni, resi, policy, usa il contesto del sito
-- se la richiesta è vaga, fai una sola domanda chiarificatrice
-- non inventare prodotti, prezzi, disponibilità, policy o tempi
 - usa SOLO i prodotti forniti se davvero pertinenti
-- se non hai certezza, dillo in modo semplice
+- se non hai certezza, dillo in modo semplice e invita a scrivere a ${SUPPORT_EMAIL}
 - non scrivere URL lunghi nel testo se non necessario
 - se proponi prodotti, massimo 2 o 3
 - se i prodotti trovati sono vuoti o poco pertinenti, non proporre articoli specifici come alternativa certa
@@ -512,10 +597,12 @@ REGOLE IMPORTANTI:
 - non trasformare consigli tecnici generali in disponibilità di catalogo
 - non suggerire additivi, miscele o ingredienti specifici come prodotti disponibili se non compaiono tra i prodotti trovati
 
-STILE:
+STILE RISPOSTA:
 - evita elenchi troppo meccanici
-- risposte naturali, concise ma utili
-- se serve, chiudi con una domanda breve
+- niente risposte troppo lunghe
+- niente interrogatori
+- se puoi aiutare subito, aiuta subito
+- se non puoi aiutare bene, dillo chiaramente e invita a scrivere a ${SUPPORT_EMAIL}
 `
           },
           {
@@ -532,12 +619,15 @@ ${JSON.stringify(siteContext, null, 2)}
 
 Prodotti trovati:
 ${JSON.stringify(products, null, 2)}
+
+Email supporto da usare se serve:
+${SUPPORT_EMAIL}
 `
           }
         ]
       });
 
-      reply = response.output_text || "Nessuna risposta generata.";
+      reply = response.output_text || `Per questa richiesta ti chiediamo di scrivere a ${SUPPORT_EMAIL}.`;
     }
 
     await saveChatMessage({
